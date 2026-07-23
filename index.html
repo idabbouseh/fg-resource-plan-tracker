@@ -284,8 +284,10 @@ function parseRom(wb, sheetName) {
       warnings.push(`${role} (${type}): weekly hours sum to ${r2(total)} but the workbook declares ${r2(declaredTotal)}.`);
     if (type === 'consulting' && rate) {
       const dd = summary(r, 'declared_dollars');
-      if (dd != null && Math.abs(total * rate - dd) > 0.01)
-        warnings.push(`${role} (consulting): hours x rate = $${r2(total*rate).toLocaleString()} but the workbook declares $${r2(dd).toLocaleString()} — its $ formulas may be broken.`);
+      if (dd != null && Math.abs(total * rate - dd) > 0.01) {
+        const diff = dd - total * rate;
+        warnings.push(`${role} (consulting): ${r2(total)} hrs × $${rate.toLocaleString()} = $${r2(total*rate).toLocaleString()}, but the workbook's Combined Total says $${r2(dd).toLocaleString()} — it ${diff > 0 ? 'overstates' : 'understates'} by $${r2(Math.abs(diff)).toLocaleString()}. Check that row's $ formulas (a year-total column may be summing the wrong range).`);
+      }
     }
     lines.push({ role, type, grade, rate, limit, weekly, total });
   }
