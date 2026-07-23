@@ -306,59 +306,235 @@ function parseRom(wb, sheetName) {
   };
 }
 
-/* ---------- CATSXT parser (port of catsxt.py) ---------- */
-const HOURS_REQUIRED = ['consultant', 'date', 'work', 'wbs'];
+/* ---------- CATSXT / time-report parser (port of catsxt.py) ---------- */
+const HOURS_REQUIRED = ['consultant', 'date', 'work'];  // wbs is optional — some exports lack it
 const HOURS_COLS = { 'consultant': 'name', 'date': 'date', 'work': 'hours', 'wbs': 'wbs',
                      'description': 'wbsDesc', 'short text': 'shortText', 'rate': 'grade',
                      'task type': 'taskType', 'location': 'location' };
 
+function parseHoursSheet(ws_, sheetName) {
+  if (!ws_ || !ws_['!ref']) return null;
+  const range = XLSX.utils.decode_range(ws_['!ref']);
+  const cell = (r, c) => { const x = ws_[XLSX.utils.encode_cell({ r, c })]; return x ? x.v : null; };
+  for (let hr = 0; hr <= Math.min(range.e.r, 5); hr++) {
+    const headers = {};
+    for (let c = 0; c <= range.e.c; c++) { const h = norm(cell(hr, c)); if (h && !(h in headers)) headers[h] = c; }
+    if (!HOURS_REQUIRED.every((k) => k in headers)) continue;
+
+    const cols = {};
+    for (const [h, f] of Object.entries(HOURS_COLS)) if (h in headers) cols[f] = headers[h];
+    const entries = []; let skipped = 0, negatives = 0, blankStreak = 0;
+    for (let r = hr + 1; r <= range.e.r; r++) {
+      const get = (f) => f in cols ? cell(r, cols[f]) : null;
+      const name = get('name'), rawDate = get('date');
+      if ((name == null || String(name).trim() === '') && rawDate == null) {
+        if (++blankStreak > 20) break; continue;
+      }
+      blankStreak = 0;
+      const iso = cellDateISO(rawDate);
+      if (!iso || name == null || String(name).trim() === '') { skipped++; continue; }
+      const hours = get('hours');
+      if (typeof hours !== 'number') { skipped++; continue; }
+      if (hours < 0) negatives++;
+      entries.push({
+        name: canonName(name), date: iso, hours,
+        wbs: get('wbs') != null ? String(get('wbs')).trim() : null,
+        wbsDesc: get('wbsDesc') != null ? String(get('wbsDesc')).trim() : null,
+        taskType: get('taskType') != null ? String(get('taskType')).trim() : null,
+        grade: get('grade') != null ? String(get('grade')).trim() : null,
+        shortText: get('shortText') != null ? String(get('shortText')).trim() : null,
+      });
+    }
+    if (!entries.length) return null;
+    const people = {};
+    for (const e of entries) people[e.name] = r2((people[e.name] || 0) + e.hours);
+    const warnings = [];
+    if (skipped) warnings.push(`${skipped} rows had no usable name, date, or hours and were skipped.`);
+    if (negatives) warnings.push(`${negatives} negative-hour correction rows were kept (they net out of totals).`);
+    const dates = entries.map((e) => e.date).sort();
+    return { entries, stats: { sheet: sheetName, periodStart: dates[0], periodEnd: dates[dates.length - 1],
+             totalHours: r2(entries.reduce((a, e) => a + e.hours, 0)), rowCount: entries.length,
+             people, warnings } };
+  }
+  return null;
+}
+
 function parseHoursWb(wb) {
   for (const sheetName of wb.SheetNames) {
-    const ws_ = wb.Sheets[sheetName];
-    if (!ws_ || !ws_['!ref']) continue;
-    const range = XLSX.utils.decode_range(ws_['!ref']);
-    const cell = (r, c) => { const x = ws_[XLSX.utils.encode_cell({ r, c })]; return x ? x.v : null; };
-    for (let hr = 0; hr <= Math.min(range.e.r, 5); hr++) {
-      const headers = {};
-      for (let c = 0; c <= range.e.c; c++) { const h = norm(cell(hr, c)); if (h && !(h in headers)) headers[h] = c; }
-      if (!HOURS_REQUIRED.every((k) => k in headers)) continue;
+    const parsed = parseHoursSheet(wb.Sheets[sheetName], sheetName);
+    if (parsed) return parsed;
+  }
+  throw new Error('No sheet has a header row with Consultant / Date / work columns. Is this the CATSXT export workbook?');
+}
 
-      const cols = {};
-      for (const [h, f] of Object.entries(HOURS_COLS)) if (h in headers) cols[f] = headers[h];
-      const entries = []; let skipped = 0, negatives = 0, blankStreak = 0;
-      for (let r = hr + 1; r <= range.e.r; r++) {
-        const get = (f) => f in cols ? cell(r, cols[f]) : null;
-        const name = get('name'), rawDate = get('date');
-        if ((name == null || String(name).trim() === '') && rawDate == null) {
-          if (++blankStreak > 20) break; continue;
-        }
-        blankStreak = 0;
-        const iso = cellDateISO(rawDate);
-        if (!iso) { skipped++; continue; }
-        const hours = get('hours');
-        if (typeof hours !== 'number') { skipped++; continue; }
-        if (hours < 0) negatives++;
-        entries.push({
-          name: canonName(name), date: iso, hours,
-          wbs: get('wbs') != null ? String(get('wbs')).trim() : null,
-          wbsDesc: get('wbsDesc') != null ? String(get('wbsDesc')).trim() : null,
-          taskType: get('taskType') != null ? String(get('taskType')).trim() : null,
-          grade: get('grade') != null ? String(get('grade')).trim() : null,
-        });
-      }
-      if (!entries.length) throw new Error('Found the export header but no data rows beneath it.');
-      const people = {};
-      for (const e of entries) people[e.name] = r2((people[e.name] || 0) + e.hours);
-      const warnings = [];
-      if (skipped) warnings.push(`${skipped} rows had no usable date or hours and were skipped.`);
-      if (negatives) warnings.push(`${negatives} negative-hour correction rows were kept (they net out of totals).`);
-      const dates = entries.map((e) => e.date).sort();
-      return { entries, stats: { sheet: sheetName, periodStart: dates[0], periodEnd: dates[dates.length - 1],
-               totalHours: r2(entries.reduce((a, e) => a + e.hours, 0)), rowCount: entries.length,
-               people, warnings } };
+/* ---------- all-in-one consumption workbook parser ---------- */
+const MONTH_NAMES = { january:1, february:2, march:3, april:4, may:5, june:6, july:7, august:8,
+                      september:9, october:10, november:11, december:12,
+                      jan:1, feb:2, mar:3, apr:4, jun:6, jul:7, aug:8, sep:9, sept:9, oct:10, nov:11, dec:12 };
+
+function parseMonthLabel(v) {
+  const m = String(v ?? '').trim().match(/^([A-Za-z]+)\.?\s*(?:\((.+)\))?$/);
+  if (!m) return null;
+  const month = MONTH_NAMES[m[1].toLowerCase()];
+  if (!month) return null;
+  let startDay = null, endDay = null;
+  if (m[2]) {
+    const days = (m[2].match(/\d+/g) || []).map(Number).filter((d) => d >= 1 && d <= 31);
+    if (days.length) { startDay = Math.min(...days); endDay = Math.max(...days); }
+  }
+  return { month, startDay, endDay };
+}
+
+const lastDayOfMonth = (y, mo) => new Date(Date.UTC(y, mo, 0)).getUTCDate();
+const iso = (y, mo, d) => `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+function parsePlanTab(ws_, sheetName) {
+  if (!ws_ || !ws_['!ref']) return null;
+  const range = XLSX.utils.decode_range(ws_['!ref']);
+  const cell = (r, c) => { const x = ws_[XLSX.utils.encode_cell({ r, c })]; return x ? x.v : null; };
+
+  // Locate the "Planned" / "Consumed" header blocks and their Hours sub-columns.
+  let plannedCol = null, consumedCol = null;
+  for (let r = 0; r <= Math.min(range.e.r, 8); r++) {
+    for (let c = 0; c <= range.e.c; c++) {
+      const h = norm(cell(r, c));
+      if (h !== 'planned' && h !== 'consumed') continue;
+      let target = c;
+      for (let c2 = c; c2 <= Math.min(c + 3, range.e.c); c2++)
+        if (norm(cell(r + 1, c2)) === 'hours') { target = c2; break; }
+      if (h === 'planned' && plannedCol == null) plannedCol = target;
+      if (h === 'consumed' && consumedCol == null) consumedCol = target;
     }
   }
-  throw new Error('No sheet has a header row with Consultant / Date / work / WBS columns. Is this the CATSXT export workbook?');
+  if (plannedCol == null) return null;
+
+  // Month rows: a month-name label with a numeric planned value; bare year rows set context.
+  const months = [];
+  let year = null, labelCol = null, declaredPlanned = null;
+  for (let r = 0; r <= range.e.r; r++) {
+    for (let c = 0; c <= Math.min(range.e.c, 4); c++) {
+      const v = cell(r, c);
+      if (v == null || String(v).trim() === '') continue;
+      if (typeof v === 'number' && v >= 2000 && v <= 2100 && Number.isInteger(v)) { year = v; labelCol = labelCol ?? c; break; }
+      if (norm(v).includes('total')) {
+        // The tab's own grand-total row (plain "Totals", not "2026 Totals") is
+        // kept for cross-checking against the month sum.
+        if (/^totals?$/.test(norm(v)) && declaredPlanned == null) declaredPlanned = asFloat(cell(r, plannedCol));
+        break;
+      }
+      const ml = parseMonthLabel(v);
+      if (ml && year != null) {
+        const planned = asFloat(cell(r, plannedCol));
+        if (planned != null) {
+          labelCol = labelCol ?? c;
+          months.push({ ...ml, year, label: String(v).trim(), planned,
+                        consumed: consumedCol != null ? asFloat(cell(r, consumedCol)) : null });
+        }
+      }
+      break; // only inspect the first non-empty cell of the row
+    }
+  }
+  if (months.length < 2) return null;
+
+  let title = null;
+  for (let r = 0; r <= 2 && !title; r++)
+    for (let c = 0; c <= 3 && !title; c++) {
+      const v = cell(r, c);
+      if (v != null && String(v).trim() !== '' && !parseMonthLabel(v)) title = String(v).trim();
+    }
+  return { sheet: sheetName, title: title || sheetName, months, declaredPlanned };
+}
+
+// Month window for spreading plan hours: the first month honors its day
+// annotation (e.g. "June (29th & 30th)" = the plan's true start); later months
+// span the full month — their annotations describe consumed coverage instead.
+function monthWindow(m, isFirst) {
+  const start = isFirst && m.startDay ? m.startDay : 1;
+  const end = isFirst && m.endDay ? m.endDay : lastDayOfMonth(m.year, m.month);
+  return { start: iso(m.year, m.month, start), end: iso(m.year, m.month, end) };
+}
+
+function weekdaysBetween(startIso, endIso) {
+  const out = [];
+  for (let d = startIso; d <= endIso; d = addDays(d, 1))
+    if (new Date(d + 'T00:00:00Z').getUTCDay() % 6 !== 0) out.push(d);
+  return out;
+}
+
+// Spread monthly planned hours across working days, bucketed into Monday weeks,
+// as one rate-less consulting line the whole team burns against.
+function planFromMonths(plan, roleName) {
+  const weeklyByStart = {};
+  plan.months.forEach((m, i) => {
+    const win = monthWindow(m, i === 0);
+    const wds = weekdaysBetween(win.start, win.end);
+    if (!wds.length) return;
+    const perDay = m.planned / wds.length;
+    for (const d of wds) weeklyByStart[mondayOf(d)] = (weeklyByStart[mondayOf(d)] || 0) + perDay;
+  });
+  const starts = Object.keys(weeklyByStart).sort();
+  if (!starts.length) throw new Error('The consumption tab has no plannable months.');
+  const weeks = [], weekly = {};
+  let no = 0;
+  for (let d = starts[0]; d <= starts[starts.length - 1]; d = addDays(d, 7)) {
+    no += 1;
+    weeks.push({ no, start: d });
+    weekly[no] = r2(weeklyByStart[d] || 0);
+  }
+  return {
+    weeks,
+    lines: [{ role: roleName, type: 'consulting', grade: null, rate: null, limit: null, weekly }],
+    planStart: monthWindow(plan.months[0], true).start,
+  };
+}
+
+// Merge selected time tabs without double counting: identical rows appearing in
+// several tabs count once per copy in the tab that has the most copies.
+function mergeTimeTabs(tabs) {
+  const acc = new Map();
+  for (const t of tabs) {
+    const local = new Map();
+    for (const e of t.entries) {
+      const k = [canonKey(e.name), e.date, e.hours, e.shortText || ''].join('|');
+      (local.get(k) || local.set(k, []).get(k)).push(e);
+    }
+    for (const [k, arr] of local) if (!acc.has(k) || arr.length > acc.get(k).length) acc.set(k, arr);
+  }
+  return [...acc.values()].flat().sort((a, b) => a.date < b.date ? -1 : 1);
+}
+
+function parseConsumptionWb(wb) {
+  const timeTabs = [], planCandidates = [];
+  for (const sheetName of wb.SheetNames) {
+    const t = parseHoursSheet(wb.Sheets[sheetName], sheetName);
+    if (t) { timeTabs.push({ name: sheetName, ...t }); continue; }
+    const p = parsePlanTab(wb.Sheets[sheetName], sheetName);
+    if (p) planCandidates.push(p);
+  }
+  if (!timeTabs.length) throw new Error('No time-reporting tabs found (need Consultant / Date / work columns).');
+  if (!planCandidates.length) throw new Error('No consumption/plan tab found (need month rows with a Planned column).');
+  const plan = planCandidates[planCandidates.length - 1]; // convention: the summary tab is last
+  return { timeTabs, plan };
+}
+
+function consumptionCrossCheck(plan, entries) {
+  const notes = [];
+  const monthSum = r2(plan.months.reduce((a, m) => a + m.planned, 0));
+  if (plan.declaredPlanned != null && Math.abs(monthSum - plan.declaredPlanned) > 0.01) {
+    notes.push({ ok: false, text: `The plan months sum to ${fmtH(monthSum)} hrs, but the tab's own Totals row says ${fmtH(plan.declaredPlanned)} — its total formula may be summing the wrong range (difference ${fmtH(r2(monthSum - plan.declaredPlanned))}). The month values are used.` });
+  }
+  for (const m of plan.months) {
+    if (m.consumed == null || m.consumed === 0) continue;
+    const win = {
+      start: iso(m.year, m.month, m.startDay || 1),
+      end: iso(m.year, m.month, m.endDay || lastDayOfMonth(m.year, m.month)),
+    };
+    const actual = r2(entries.filter((e) => e.date >= win.start && e.date <= win.end)
+      .reduce((a, e) => a + e.hours, 0));
+    if (Math.abs(actual - m.consumed) <= 0.01) notes.push({ ok: true, text: `${m.label} ${m.year}: report says ${m.consumed} hrs consumed — matches the raw time rows.` });
+    else notes.push({ ok: false, text: `${m.label} ${m.year}: report says ${m.consumed} hrs consumed, but the raw time rows in that window sum to ${actual} — the manual report may be missing rows (difference ${r2(actual - m.consumed)}).` });
+  }
+  return notes;
 }
 
 /* ---------- metrics engine (port of metrics.py) ---------- */
@@ -555,9 +731,12 @@ let chartMode = 'cd';
 let chartGrain = 'weeks'; // 'weeks' | 'months'
 let planUpload = null;   // {wb, filename, sheets, sheet, preview, error}
 let hoursUpload = null;  // {filename, parsed, error}
+let wbUpload = null;     // {filename, parsed:{timeTabs, plan}, selected:[names], includePre, error}
 let flash = null;
 let newProjOpen = false;
 let armed = null; // 'clearHours' | 'deleteProject' — two-click confirm, no dialogs
+let exportDollars = true;
+let exportPeople = true;
 
 function chip(status, pct) {
   if (!status) return `<span class="chip chip-none"><span class="dot"></span>No plan</span>`;
@@ -623,6 +802,8 @@ function renderDashboard(proj, m) {
   const planByLine = {};
   for (const l of m.lines) planByLine[l.type + '|' + l.role] = Object.fromEntries(l.weekly.map((w) => [w.start, w.planned]));
   const overBudget = cons.projectedExhaustion && m.weeks.last && cons.projectedExhaustion <= m.weeks.last;
+  const hasRates = m.lines.some((l) => l.type === 'consulting' && l.rate);
+  const hasEmb = m.lines.some((l) => l.type === 'embedded');
   return `
     <div class="stack">
       ${!proj.plan ? `<div class="banner warn">No plan imported yet — go to <a href="#" data-goto="data">Import &amp; data</a> to load the ROM workbook.</div>` : ''}
@@ -632,18 +813,22 @@ function renderDashboard(proj, m) {
         <div class="row">
           <label class="small muted">As of <input type="date" id="asOfInput" value="${m.asOf}"></label>
           ${tracks.length > 1 ? `<select id="trackSel"><option value="">All release tracks</option>${tracks.map((t) => `<option value="${esc(t)}" ${track === t ? 'selected' : ''}>${esc(wbsDesc[t] || t)}</option>`).join('')}</select>` : ''}
+          ${proj.plan ? `<span class="small muted row" style="gap:6px">
+            ${hasRates ? `<label class="row" style="gap:3px;cursor:pointer"><input type="checkbox" id="expDollars" ${exportDollars ? 'checked' : ''}>$</label>` : ''}
+            <label class="row" style="gap:3px;cursor:pointer"><input type="checkbox" id="expPeople" ${exportPeople ? 'checked' : ''}>people</label>
+            <button id="exportBtn" title="Download a client-ready burn report (open it and print to PDF)">Export report</button></span>` : ''}
         </div>
       </div>
       <div class="grid-tiles">
-        <div class="card tile"><div class="label">Consulting burn ($)</div>
+        ${hasRates ? `<div class="card tile"><div class="label">Consulting burn ($)</div>
           <div class="value">${fmtD(cons.dollars ? cons.dollars.actualToDate : null)}</div>
-          <div class="row" style="gap:8px">${chip(cons.status, cons.pct)}<span class="detail">of ${fmtD(cons.dollars ? cons.dollars.planToDate : null)} to date · ${fmtD(cons.dollars ? cons.dollars.planTotal : null)} total</span></div></div>
+          <div class="row" style="gap:8px">${chip(cons.status, cons.pct)}<span class="detail">of ${fmtD(cons.dollars ? cons.dollars.planToDate : null)} to date · ${fmtD(cons.dollars ? cons.dollars.planTotal : null)} total</span></div></div>` : ''}
         <div class="card tile"><div class="label">Consulting hours</div>
           <div class="value">${fmtH(cons.actualToDate)}</div>
-          <div class="row" style="gap:8px">${chip(cons.status, cons.pct)}<span class="detail">of ${fmtH(cons.planToDate)} planned to date</span></div></div>
-        <div class="card tile"><div class="label">Embedded hours</div>
+          <div class="row" style="gap:8px">${chip(cons.status, cons.pct)}<span class="detail">of ${fmtH(cons.planToDate)} planned to date · ${fmtH(cons.planTotal)} total</span></div></div>
+        ${hasEmb ? `<div class="card tile"><div class="label">Embedded hours</div>
           <div class="value">${fmtH(emb.actualToDate)}</div>
-          <div class="row" style="gap:8px">${chip(emb.status, emb.pct)}<span class="detail">of ${fmtH(emb.planToDate)} to date · limit ${fmtH(emb.limitTotal)}</span></div></div>
+          <div class="row" style="gap:8px">${chip(emb.status, emb.pct)}<span class="detail">of ${fmtH(emb.planToDate)} to date · limit ${fmtH(emb.limitTotal)}</span></div></div>` : ''}
         <div class="card tile"><div class="label">Consulting pace</div>
           <div class="value">${fmtH(cons.runrate)}/wk</div>
           <div class="row" style="gap:8px">${overBudget ? chip('red', null) : ''}<span class="detail">${cons.projectedExhaustion ? `exhausts plan ~${fmtDate(cons.projectedExhaustion)} (plan ends ${fmtDate(m.weeks.last)})` : 'no recent burn'}</span></div></div>
@@ -711,7 +896,9 @@ function monthlyBurn(burn) {
 const fmtMonth = (mk) => new Date(mk + '-01T00:00:00').toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
 
 function renderBurnChart(m) {
-  const mode = CHART_MODES[chartMode];
+  const effMode = effectiveChartMode(m);
+  const mode = CHART_MODES[effMode];
+  const avail = availableChartModes(m);
   const hasProj = mode.proj && m.burn.some((b) => b[mode.proj] != null);
   return `
     <div class="card">
@@ -722,8 +909,8 @@ function renderBurnChart(m) {
             ${[['weeks', 'Weeks'], ['months', 'Months']].map(([k, label]) =>
               `<button data-grain="${k}" style="${chartGrain === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${label}</button>`).join('')}
           </span>
-          ${Object.entries(CHART_MODES).map(([k, mo]) =>
-            `<button data-mode="${k}" style="${chartMode === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${mo.label}</button>`).join('')}
+          ${avail.map((k) =>
+            `<button data-mode="${k}" style="${effMode === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${CHART_MODES[k].label}</button>`).join('')}
         </div>
       </div>
       <div class="legend" style="margin-bottom:4px">
@@ -735,14 +922,24 @@ function renderBurnChart(m) {
     </div>`;
 }
 
-function drawChart(m) {
-  const wrap = $('#chartWrap');
-  if (!wrap) return;
-  const mode = CHART_MODES[chartMode];
-  const W = Math.max(wrap.clientWidth, 320), H = 260, padL = 62, padR = 16, padT = 10, padB = 26;
-  const monthly = chartGrain === 'months';
+function availableChartModes(m) {
+  const hasRates = m.lines.some((l) => l.type === 'consulting' && l.rate);
+  const hasEmb = m.lines.some((l) => l.type === 'embedded');
+  return Object.keys(CHART_MODES).filter((k) => (k !== 'cd' || hasRates) && (k !== 'eh' || hasEmb));
+}
+function effectiveChartMode(m) {
+  const avail = availableChartModes(m);
+  return avail.includes(chartMode) ? chartMode : (avail[1] === 'ch' ? 'ch' : avail[0]);
+}
+
+// Pure geometry + markup for the burn chart; drawChart adds the hover layer,
+// the report export embeds the same body directly.
+function buildChartParts(m, modeKey, grain, W, H) {
+  const mode = CHART_MODES[modeKey];
+  const padL = 62, padR = 16, padT = 10, padB = 26;
+  const monthly = grain === 'months';
   const data = monthly ? monthlyBurn(m.burn) : m.burn;
-  if (!data.length) { wrap.insertAdjacentHTML('beforeend', '<div class="empty">No data yet</div>'); return; }
+  if (!data.length) return null;
   const series = ['plan', 'act', 'proj'].map((k) => mode[k]).filter(Boolean);
   const maxV = Math.max(...data.flatMap((d) => series.map((s) => d[s] || 0)), 1);
   const x = (i) => padL + (i / Math.max(data.length - 1, 1)) * (W - padL - padR);
@@ -768,12 +965,23 @@ function drawChart(m) {
   const lastElapsedIdx = data.reduce((a, pt, i) => pt.elapsed ? i : a, -1);
   const asOfLine = lastElapsedIdx >= 0 ? `<line x1="${x(lastElapsedIdx)}" x2="${x(lastElapsedIdx)}" y1="${padT}" y2="${H - padB}" stroke="var(--baseline)" stroke-width="1"/>
     <text x="${x(lastElapsedIdx) - 4}" y="${padT + 10}" text-anchor="end" font-size="10" fill="var(--muted)">as of</text>` : '';
-  wrap.insertAdjacentHTML('beforeend', `
-    <svg id="burnSvg" width="${W}" height="${H}" role="img" aria-label="cumulative burn versus plan">
-      ${grid}${xLabels}${asOfLine}
+  const body = `${grid}${xLabels}${asOfLine}
       <path d="${pathFor(mode.plan)}" fill="none" stroke="var(--plan)" stroke-width="2" stroke-linejoin="round"/>
       <path d="${pathFor(mode.act)}" fill="none" stroke="var(--actual)" stroke-width="2" stroke-linejoin="round"/>
-      ${mode.proj ? `<path d="${pathFor(mode.proj)}" fill="none" stroke="var(--actual)" stroke-width="2" stroke-dasharray="5 4" opacity=".7"/>` : ''}
+      ${mode.proj ? `<path d="${pathFor(mode.proj)}" fill="none" stroke="var(--actual)" stroke-width="2" stroke-dasharray="5 4" opacity=".7"/>` : ''}`;
+  return { body, data, x, y, maxV, monthly, mode, padL, padR, padT, padB };
+}
+
+function drawChart(m) {
+  const wrap = $('#chartWrap');
+  if (!wrap) return;
+  const W = Math.max(wrap.clientWidth, 320), H = 260;
+  const parts = buildChartParts(m, effectiveChartMode(m), chartGrain, W, H);
+  if (!parts) { wrap.insertAdjacentHTML('beforeend', '<div class="empty">No data yet</div>'); return; }
+  const { body, data, x, monthly, mode, padL, padR, padT, padB } = parts;
+  wrap.insertAdjacentHTML('beforeend', `
+    <svg id="burnSvg" width="${W}" height="${H}" role="img" aria-label="cumulative burn versus plan">
+      ${body}
       <line id="crosshair" y1="${padT}" y2="${H - padB}" stroke="var(--baseline)" stroke-width="1" style="display:none"/>
       <rect x="${padL}" y="${padT}" width="${W - padL - padR}" height="${H - padT - padB}" fill="transparent" id="chartHover"/>
     </svg>`);
@@ -830,7 +1038,10 @@ function renderHeatGrid(m) {
         <span>· future weeks show plan only</span></div>
       <div class="heat-wrap"><table class="heat">
         <thead><tr><th class="rowhead">Role</th>${weeks.map((wk) => `<th title="week of ${fmtDate(wk)}">${noByWeek[wk] ?? 'w0'}<div style="font-weight:400">${fmtDate(wk).replace(/, .*$/, '')}</div></th>`).join('')}</tr></thead>
-        <tbody>${band('Embedded', m.lines.filter((l) => l.type === 'embedded'))}${band('Consulting', m.lines.filter((l) => l.type === 'consulting'))}</tbody>
+        <tbody>${['embedded', 'consulting'].map((t) => {
+          const subset = m.lines.filter((l) => l.type === t);
+          return subset.length ? band(t === 'embedded' ? 'Embedded' : 'Consulting', subset) : '';
+        }).join('')}</tbody>
       </table></div></div>`;
 }
 
@@ -838,6 +1049,15 @@ function renderData(proj) {
   const pu = planUpload, hu = hoursUpload;
   return `
     <div class="stack" style="max-width:920px">
+      <div class="card">
+        <h3>All-in-one consumption workbook</h3>
+        <p class="small muted" style="margin-top:0">One file with CATS time tabs plus a monthly plan/consumption summary tab
+        (e.g. a DE's consumption report). Imports the plan <em>and</em> the hours together, and cross-checks the report's
+        consumed figures against the raw time rows.</p>
+        <input type="file" id="wbFile" accept=".xlsx,.xlsm">
+        ${wbUpload && wbUpload.error ? `<div class="banner error" style="margin-top:10px">${esc(wbUpload.error)}</div>` : ''}
+        ${wbUpload && wbUpload.parsed ? renderWorkbookPreview(proj, wbUpload) : ''}
+      </div>
       <div class="card">
         <h3>Plan — ROM workbook</h3>
         <p class="small muted" style="margin-top:0">Upload the delivery executive's file as-is. Parsing happens in this browser; the file goes nowhere.
@@ -865,6 +1085,66 @@ function renderData(proj) {
           ${!proj.uploads.length ? '<tr><td colspan="4" class="empty">Nothing uploaded yet.</td></tr>' : ''}
         </tbody></table>
       </div>
+    </div>`;
+}
+
+function workbookSelection(up) {
+  const tabs = up.parsed.timeTabs.filter((t) => up.selected.includes(t.name));
+  const merged = mergeTimeTabs(tabs);
+  const built = planFromMonths(up.parsed.plan, up.roleName);
+  const pre = merged.filter((e) => e.date < built.planStart);
+  const kept = up.includePre ? merged : merged.filter((e) => e.date >= built.planStart);
+  return { merged, built, pre, kept };
+}
+
+function renderWorkbookPreview(proj, up) {
+  const { plan } = up.parsed;
+  const { built, pre, kept } = workbookSelection(up);
+  const planTotal = plan.months.reduce((a, m) => a + m.planned, 0);
+  const notes = consumptionCrossCheck(plan, kept.length ? kept : []);
+  const keptHours = r2(kept.reduce((a, e) => a + e.hours, 0));
+  const people = new Set(kept.map((e) => canonKey(e.name))).size;
+  return `
+    <div style="margin-top:12px">
+      <div class="grid-tiles">
+        <div class="card tile"><div class="label">Plan (from "${esc(plan.sheet)}")</div>
+          <div class="value">${fmtH(planTotal)} hrs</div>
+          <div class="detail">${plan.months.length} months · starts ${fmtDate(built.planStart)} · ${esc(plan.title)}</div></div>
+        <div class="card tile"><div class="label">Hours to load</div>
+          <div class="value">${fmtH(keptHours)}</div>
+          <div class="detail">${kept.length} rows · ${people} people${kept.length ? ` · ${fmtDate(kept[0].date)} – ${fmtDate(kept[kept.length - 1].date)}` : ''}</div></div>
+      </div>
+      <div class="small" style="margin-bottom:8px"><strong>Time tabs</strong> — overlapping copies are de-duplicated; pick which to use:</div>
+      ${up.parsed.timeTabs.map((t) => `
+        <label class="row small" style="gap:8px;margin-bottom:4px;cursor:pointer">
+          <input type="checkbox" data-wbtab="${esc(t.name)}" ${up.selected.includes(t.name) ? 'checked' : ''}>
+          <strong>${esc(t.name)}</strong>
+          <span class="muted">${t.stats.rowCount} rows · ${fmtH(t.stats.totalHours)} hrs · ${fmtDate(t.stats.periodStart)} – ${fmtDate(t.stats.periodEnd)}</span>
+        </label>`).join('')}
+      ${pre.length ? `
+        <label class="row small" style="gap:8px;margin:8px 0;cursor:pointer">
+          <input type="checkbox" id="wbIncludePre" ${up.includePre ? 'checked' : ''}>
+          Include ${pre.length} rows (${fmtH(r2(pre.reduce((a, e) => a + e.hours, 0)))} hrs) dated before the plan starts ${fmtDate(built.planStart)}
+          <span class="muted">— usually earlier contracts; leave off to track this plan only</span>
+        </label>` : ''}
+      <table class="data" style="margin-top:6px"><thead><tr><th>Month</th><th class="num">Planned</th><th class="num">Report consumed</th><th class="num">Raw rows say</th></tr></thead><tbody>
+        ${plan.months.map((m) => {
+          const win = { start: iso(m.year, m.month, m.startDay || 1), end: iso(m.year, m.month, m.endDay || lastDayOfMonth(m.year, m.month)) };
+          const actual = r2(kept.filter((e) => e.date >= win.start && e.date <= win.end).reduce((a, e) => a + e.hours, 0));
+          return `<tr><td>${esc(m.label)} ${m.year}</td><td class="num">${fmtH(m.planned)}</td>
+            <td class="num muted">${m.consumed != null ? fmtH(m.consumed) : '—'}</td>
+            <td class="num">${actual ? fmtH(actual) : '—'}</td></tr>`;
+        }).join('')}
+      </tbody></table>
+      ${notes.length ? `<div class="banner ${notes.some((n) => !n.ok) ? 'warn' : 'ok'}" style="margin-top:12px">
+        <strong>Cross-check vs the report's consumed column:</strong>
+        <ul class="warnlist">${notes.map((n) => `<li>${n.ok ? '✓' : '⚠'} ${esc(n.text)}</li>`).join('')}</ul></div>` : ''}
+      <div class="row" style="margin-top:12px">
+        <input id="wbRole" value="${esc(up.roleName)}" style="min-width:180px" title="Label for the single plan line the team burns against">
+        <button class="primary" id="wbConfirm" ${kept.length ? '' : 'disabled'}>Import plan + hours</button>
+      </div>
+      <div class="small muted" style="margin-top:6px">Everyone in these tabs is auto-classified to the single consulting line
+      (editable later in the roster). Confirming replaces the current plan and the hours in the loaded period.</div>
     </div>`;
 }
 
@@ -975,15 +1255,97 @@ function readFileAsWb(file, cb, onErr) {
   reader.readAsArrayBuffer(file);
 }
 
-function downloadJSON(filename, data) {
+function downloadFile(filename, data, mime) {
   if (window.claude && window.claude.downloads && window.claude.downloads.save) {
     window.claude.downloads.save({ filename, data }).catch(() => {});
     return;
   }
-  const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+  const url = URL.createObjectURL(new Blob([data], { type: mime || 'application/octet-stream' }));
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+const downloadJSON = (filename, data) => downloadFile(filename, data, 'application/json');
+
+/* ---------- client-facing report export ---------- */
+function buildReport(proj, m) {
+  const hasRates = m.lines.some((l) => l.type === 'consulting' && l.rate);
+  const hasEmb = m.lines.some((l) => l.type === 'embedded');
+  const useDollars = exportDollars && hasRates;
+  const modeKey = useDollars ? 'cd' : 'ch';
+  const grain = m.weeks.total > 20 ? 'months' : chartGrain;
+  const parts = buildChartParts(m, modeKey, grain, 900, 260);
+  const cons = m.consulting;
+
+  const chipHtml = (status, pct) => {
+    const c = { green: ['#0ca30c', 'On track'], amber: ['#b97e00', 'Watch'], red: ['#d03b3b', 'Over'] }[status];
+    if (!c) return '<span style="color:#898781">—</span>';
+    return `<span style="color:${c[0]};font-weight:600">● ${c[1]}${pct != null ? ' · ' + Math.round(pct) + '%' : ''}</span>`;
+  };
+
+  const months = monthlyBurn(m.burn);
+  const monthRows = months.map((pt, i) => {
+    const prev = i ? months[i - 1] : null;
+    const d = (k) => r2((pt[k] || 0) - (prev ? prev[k] || 0 : 0));
+    const planH = d('planConsH');
+    const actH = pt.actConsH != null ? r2((pt.actConsH || 0) - (prev && prev.actConsH != null ? prev.actConsH : 0)) : null;
+    const cumPct = pt.actConsH != null && pt.planConsH > 0 ? Math.round(pt.actConsH / pt.planConsH * 100) : null;
+    return `<tr><td>${fmtMonth(pt._mk || pt.week.slice(0, 7))}</td>
+      <td class="n">${fmtH(planH)}</td><td class="n">${actH != null ? fmtH(actH) : '—'}</td>
+      ${useDollars ? `<td class="n">${fmtD(d('planConsD'))}</td><td class="n">${pt.actConsD != null ? fmtD(r2((pt.actConsD || 0) - (prev && prev.actConsD != null ? prev.actConsD : 0))) : '—'}</td>` : ''}
+      ${hasEmb ? `<td class="n">${fmtH(d('planEmbH'))}</td><td class="n">${pt.actEmbH != null ? fmtH(r2((pt.actEmbH || 0) - (prev && prev.actEmbH != null ? prev.actEmbH : 0))) : '—'}</td>` : ''}
+      <td class="n">${cumPct != null ? cumPct + '%' : '—'}</td></tr>`;
+  }).join('');
+
+  const peopleRows = exportPeople ? m.trending.filter((t) => t.classified).map((t) => `
+    <tr><td>${esc(t.name)}</td><td class="mut">${esc(t.role)} · ${esc(t.type)}</td>
+      <td class="n">${fmtH(t.hoursToDate)}</td><td class="n">${t.linePlanToDate != null ? fmtH(t.linePlanToDate) : '—'}</td>
+      <td>${chipHtml(t.status, t.pct)}</td></tr>`).join('') : '';
+
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(proj.name)} — Burn report ${m.asOf}</title>
+<style>
+  :root { --plan:#eb6834; --actual:#2a78d6; --grid:#e1e0d9; --baseline:#c3c2b7; --muted:#898781; }
+  body { margin:0; padding:36px 44px; font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:#0b0b0b; background:#fff; max-width:980px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 2px; } h2 { font-size:14px; color:#52514e; margin:26px 0 8px; }
+  .sub { color:#898781; font-size:12px; margin-bottom:22px; }
+  .tiles { display:flex; gap:24px; flex-wrap:wrap; margin-bottom:8px; }
+  .tile .l { font-size:11px; color:#52514e; text-transform:uppercase; letter-spacing:.05em; }
+  .tile .v { font-size:24px; font-weight:650; }
+  .tile .d { font-size:12px; color:#898781; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th { text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:#898781; padding:5px 8px; border-bottom:1px solid #e1e0d9; }
+  td { padding:6px 8px; border-bottom:1px solid #eeede8; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  td.mut { color:#898781; }
+  .legend { font-size:12px; color:#52514e; margin:4px 0 2px; } .legend span { margin-right:14px; }
+  .k { display:inline-block; width:14px; height:2.5px; border-radius:2px; vertical-align:middle; margin-right:4px; }
+  .foot { margin-top:30px; font-size:11px; color:#898781; border-top:1px solid #e1e0d9; padding-top:8px; }
+  @media print { body { padding:0; } @page { margin:18mm; } }
+</style></head><body>
+  <h1>${esc(proj.name)} — Resource burn report</h1>
+  <div class="sub">${proj.client ? esc(proj.client) + ' · ' : ''}${esc(proj.plan.label)} · as of ${fmtDate(m.asOf)} · week ${m.weeks.elapsed} of ${m.weeks.total}${m.track ? ' · track: ' + esc(m.track) : ''}</div>
+  <div class="tiles">
+    ${useDollars ? `<div class="tile"><div class="l">Consulting burn</div><div class="v">${fmtD(cons.dollars.actualToDate)}</div><div class="d">of ${fmtD(cons.dollars.planToDate)} planned to date (${cons.pct != null ? Math.round(cons.pct) + '%' : '—'})</div></div>` : ''}
+    <div class="tile"><div class="l">Consulting hours</div><div class="v">${fmtH(cons.actualToDate)}</div><div class="d">of ${fmtH(cons.planToDate)} to date · ${fmtH(cons.planTotal)} total plan</div></div>
+    ${hasEmb ? `<div class="tile"><div class="l">Embedded hours</div><div class="v">${fmtH(m.embedded.actualToDate)}</div><div class="d">of ${fmtH(m.embedded.planToDate)} to date</div></div>` : ''}
+    <div class="tile"><div class="l">Status</div><div class="v" style="font-size:16px;padding-top:6px">${chipHtml(cons.status, cons.pct)}</div><div class="d">${cons.projectedExhaustion ? `at current pace, plan exhausts ~${fmtDate(cons.projectedExhaustion)}` : ''}</div></div>
+  </div>
+  <h2>Cumulative burn vs plan${useDollars ? ' ($)' : ' (hours)'}</h2>
+  <div class="legend"><span><span class="k" style="background:#eb6834"></span>Plan</span><span><span class="k" style="background:#2a78d6"></span>Actual</span><span><span class="k" style="border-top:2.5px dashed #2a78d6;height:0"></span>Projected</span></div>
+  ${parts ? `<svg width="900" height="260" viewBox="0 0 900 260" style="max-width:100%">${parts.body}</svg>` : ''}
+  <h2>By month</h2>
+  <table><thead><tr><th>Month</th><th class="n">Plan hrs</th><th class="n">Actual hrs</th>
+    ${useDollars ? '<th class="n">Plan $</th><th class="n">Actual $</th>' : ''}
+    ${hasEmb ? '<th class="n">Embedded plan</th><th class="n">Embedded actual</th>' : ''}
+    <th class="n">Cumulative %</th></tr></thead>
+  <tbody>${monthRows}</tbody></table>
+  ${exportPeople ? `<h2>By person</h2>
+  <table><thead><tr><th>Person</th><th>Line</th><th class="n">Burned hrs</th><th class="n">Line plan to date</th><th>Status</th></tr></thead>
+  <tbody>${peopleRows}</tbody></table>` : ''}
+  <div class="foot">Generated ${new Date().toLocaleDateString()} by FG Resource Plan Tracker. Actuals from CATS time reporting; plan from ${esc(proj.plan.label)}. Cumulative figures run through the last fully completed week.</div>
+</body></html>`;
 }
 
 function wire() {
@@ -1017,9 +1379,63 @@ function wire() {
   });
 
   $('#asOfInput')?.addEventListener('change', (e) => { asOf = e.target.value || todayISO(); render(); });
+  $('#exportBtn')?.addEventListener('click', () => {
+    if (!chartMetrics) return;
+    const name = `${proj.name.replace(/[^\w-]+/g, '_')}_burn_report_${chartMetrics.asOf}.html`;
+    downloadFile(name, buildReport(proj, chartMetrics), 'text/html');
+  });
+  $('#expDollars')?.addEventListener('change', (e) => { exportDollars = e.target.checked; });
+  $('#expPeople')?.addEventListener('change', (e) => { exportPeople = e.target.checked; });
   $('#trackSel')?.addEventListener('change', (e) => { track = e.target.value; render(); });
   document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { chartMode = b.dataset.mode; render(); }));
   document.querySelectorAll('[data-grain]').forEach((b) => b.addEventListener('click', () => { chartGrain = b.dataset.grain; render(); }));
+
+  $('#wbFile')?.addEventListener('change', (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    readFileAsWb(f, (wb) => {
+      try {
+        const parsed = parseConsumptionWb(wb);
+        // Default to the single most complete time tab; DE workbooks often
+        // contain overlapping partial copies of the same feed.
+        const best = [...parsed.timeTabs].sort((a, b) => b.stats.totalHours - a.stats.totalHours)[0];
+        const crMatch = parsed.plan.title.match(/CR\s*\(?[\d/. -]+\)?/i);
+        wbUpload = { filename: f.name, parsed, selected: [best.name], includePre: false,
+                     roleName: crMatch ? `Team (${crMatch[0].trim()})` : 'Team', error: null };
+      } catch (err) { wbUpload = { filename: f.name, parsed: null, error: err.message }; }
+      render();
+    }, (err) => { wbUpload = { error: err, parsed: null }; render(); });
+  });
+  document.querySelectorAll('[data-wbtab]').forEach((cb) => cb.addEventListener('change', () => {
+    const name = cb.dataset.wbtab;
+    wbUpload.selected = cb.checked ? [...wbUpload.selected, name] : wbUpload.selected.filter((n) => n !== name);
+    render();
+  }));
+  $('#wbIncludePre')?.addEventListener('change', (e) => { wbUpload.includePre = e.target.checked; render(); });
+  $('#wbRole')?.addEventListener('change', (e) => { wbUpload.roleName = e.target.value.trim() || 'Team'; render(); });
+  $('#wbConfirm')?.addEventListener('click', () => {
+    const { built, kept } = workbookSelection(wbUpload);
+    const label = `${wbUpload.parsed.plan.title} — ${wbUpload.filename}`;
+    proj.plan = { label, imported_at: todayISO(), weeks: built.weeks,
+                  lines: built.lines.map((l) => ({ ...l, weekly: Object.fromEntries(Object.entries(l.weekly).filter(([, h]) => h)) })),
+                  warnings: [] };
+    const dates = kept.map((e) => e.date).sort();
+    proj.entries = proj.entries.filter((e) => e.date < dates[0] || e.date > dates[dates.length - 1]);
+    proj.entries.push(...kept);
+    const roleName = built.lines[0].role;
+    const known = new Map(proj.roster.map((p) => [canonKey(p.name), p]));
+    let autoClassified = 0;
+    for (const name of new Set(kept.map((e) => e.name))) {
+      const existing = known.get(canonKey(name));
+      if (!existing) { proj.roster.push({ name, type: 'consulting', role: roleName, aliases: [] }); autoClassified++; }
+      else if (!(existing.type && existing.role)) { existing.type = 'consulting'; existing.role = roleName; autoClassified++; }
+    }
+    proj.uploads.push({ kind: 'workbook', filename: wbUpload.filename, at: todayISO(), rows: kept.length,
+                        period: dates.length ? `${dates[0]} to ${dates[dates.length - 1]}` : '' });
+    wbUpload = null; save();
+    flash = { kind: 'ok', html: `Imported plan (<strong>${esc(label)}</strong>) and ${kept.length} time rows.` +
+             (autoClassified ? ` ${autoClassified} people auto-classified to "${esc(roleName)}" — adjust in the roster if needed.` : '') };
+    view = 'dashboard'; render();
+  });
 
   $('#planFile')?.addEventListener('change', (e) => {
     const f = e.target.files[0]; if (!f) return;
