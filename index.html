@@ -552,6 +552,7 @@ let view = 'dashboard';
 let asOf = todayISO();
 let track = '';
 let chartMode = 'cd';
+let chartGrain = 'weeks'; // 'weeks' | 'months'
 let planUpload = null;   // {wb, filename, sheets, sheet, preview, error}
 let hoursUpload = null;  // {filename, parsed, error}
 let flash = null;
@@ -691,6 +692,24 @@ const CHART_MODES = {
   eh: { label: 'Embedded hrs', plan: 'planEmbH', act: 'actEmbH', proj: null, fmt: fmtH },
 };
 
+// Collapse the weekly cumulative series to one point per calendar month (the
+// month's last week). Actual/projection values carry forward within a month so
+// a partially elapsed month still shows burn through its latest elapsed week.
+function monthlyBurn(burn) {
+  const out = [];
+  for (const pt of burn) {
+    const mk = pt.week.slice(0, 7);
+    const last = out[out.length - 1];
+    if (!last || last._mk !== mk) { out.push({ ...pt, _mk: mk }); continue; }
+    const merged = { ...pt, _mk: mk, elapsed: pt.elapsed || last.elapsed };
+    for (const k of ['actConsH', 'actConsD', 'actEmbH', 'projConsH', 'projConsD'])
+      if (merged[k] == null && last[k] != null) merged[k] = last[k];
+    out[out.length - 1] = merged;
+  }
+  return out;
+}
+const fmtMonth = (mk) => new Date(mk + '-01T00:00:00').toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
+
 function renderBurnChart(m) {
   const mode = CHART_MODES[chartMode];
   const hasProj = mode.proj && m.burn.some((b) => b[mode.proj] != null);
@@ -698,8 +717,14 @@ function renderBurnChart(m) {
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:6px">
         <h3 style="margin:0">Cumulative burn vs plan</h3>
-        <div class="row" style="gap:4px">${Object.entries(CHART_MODES).map(([k, mo]) =>
-          `<button data-mode="${k}" style="${chartMode === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${mo.label}</button>`).join('')}</div>
+        <div class="row" style="gap:4px">
+          <span class="row" style="gap:2px;margin-right:8px">
+            ${[['weeks', 'Weeks'], ['months', 'Months']].map(([k, label]) =>
+              `<button data-grain="${k}" style="${chartGrain === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${label}</button>`).join('')}
+          </span>
+          ${Object.entries(CHART_MODES).map(([k, mo]) =>
+            `<button data-mode="${k}" style="${chartMode === k ? 'background:var(--wash-accent);font-weight:600' : ''}">${mo.label}</button>`).join('')}
+        </div>
       </div>
       <div class="legend" style="margin-bottom:4px">
         <span class="key"><span class="swatch" style="background:var(--plan)"></span>Plan</span>
@@ -715,7 +740,8 @@ function drawChart(m) {
   if (!wrap) return;
   const mode = CHART_MODES[chartMode];
   const W = Math.max(wrap.clientWidth, 320), H = 260, padL = 62, padR = 16, padT = 10, padB = 26;
-  const data = m.burn;
+  const monthly = chartGrain === 'months';
+  const data = monthly ? monthlyBurn(m.burn) : m.burn;
   if (!data.length) { wrap.insertAdjacentHTML('beforeend', '<div class="empty">No data yet</div>'); return; }
   const series = ['plan', 'act', 'proj'].map((k) => mode[k]).filter(Boolean);
   const maxV = Math.max(...data.flatMap((d) => series.map((s) => d[s] || 0)), 1);
@@ -735,9 +761,10 @@ function drawChart(m) {
     return `<line x1="${padL}" x2="${W - padR}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>
             <text x="${padL - 8}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="var(--muted)">${mode.fmt(v)}</text>`;
   }).join('');
-  const xEvery = Math.max(1, Math.ceil(data.length / 8));
+  const xEvery = Math.max(1, Math.ceil(data.length / (monthly ? 14 : 8)));
+  const xLabel = (pt) => monthly ? fmtMonth(pt._mk) : fmtDate(pt.week);
   const xLabels = data.map((pt, i) => i % xEvery === 0 ?
-    `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">${fmtDate(pt.week)}</text>` : '').join('');
+    `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">${xLabel(pt)}</text>` : '').join('');
   const lastElapsedIdx = data.reduce((a, pt, i) => pt.elapsed ? i : a, -1);
   const asOfLine = lastElapsedIdx >= 0 ? `<line x1="${x(lastElapsedIdx)}" x2="${x(lastElapsedIdx)}" y1="${padT}" y2="${H - padB}" stroke="var(--baseline)" stroke-width="1"/>
     <text x="${x(lastElapsedIdx) - 4}" y="${padT + 10}" text-anchor="end" font-size="10" fill="var(--muted)">as of</text>` : '';
@@ -760,7 +787,7 @@ function drawChart(m) {
     const rows = [['Plan', pt[mode.plan]], ['Actual', pt[mode.act]], ['Projected', mode.proj ? pt[mode.proj] : null]]
       .filter(([, v]) => v != null)
       .map(([n, v]) => `<div class="trow"><span class="muted">${n}</span><strong class="num">${mode.fmt(v)}</strong></div>`).join('');
-    tip.innerHTML = `<div class="muted" style="margin-bottom:4px">Week of ${fmtDate(pt.week)}</div>${rows}`;
+    tip.innerHTML = `<div class="muted" style="margin-bottom:4px">${monthly ? fmtMonth(pt._mk) + ' (through wk of ' + fmtDate(pt.week) + ')' : 'Week of ' + fmtDate(pt.week)}</div>${rows}`;
     tip.style.display = 'block';
     const tw = tip.offsetWidth;
     tip.style.left = Math.min(x(i) + 12, W - tw - 8) + 'px';
@@ -992,6 +1019,7 @@ function wire() {
   $('#asOfInput')?.addEventListener('change', (e) => { asOf = e.target.value || todayISO(); render(); });
   $('#trackSel')?.addEventListener('change', (e) => { track = e.target.value; render(); });
   document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { chartMode = b.dataset.mode; render(); }));
+  document.querySelectorAll('[data-grain]').forEach((b) => b.addEventListener('click', () => { chartGrain = b.dataset.grain; render(); }));
 
   $('#planFile')?.addEventListener('change', (e) => {
     const f = e.target.files[0]; if (!f) return;
